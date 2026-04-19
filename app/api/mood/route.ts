@@ -12,13 +12,16 @@ export async function GET() {
   try {
     const session = await auth()
 
-    if (!session?.accessToken) {
+    if (!session) {
       return Response.json({ error: "Not authenticated" }, { status: 401 })
     }
 
-    const token = session.accessToken
+    const token = (session as any).accessToken
 
-    // 1. Get now playing + recent tracks
+    if (!token) {
+      return Response.json({ error: "No access token" }, { status: 401 })
+    }
+
     const [nowPlaying, recent] = await Promise.all([
       getNowPlaying(token),
       getRecentTracks(token),
@@ -28,14 +31,21 @@ export async function GET() {
       return Response.json({ error: "No recent tracks found" }, { status: 404 })
     }
 
-    const tracks = recent.items.map((i: any) => i.track)
+    const tracks = recent.items.map((i: any) => i.track).filter(Boolean)
     const trackIds = tracks.map((t: any) => t.id).filter(Boolean)
 
-    // 2. Get audio features for all tracks
-    const { audio_features } = await getAudioFeatures(token, trackIds)
-    const validFeatures = audio_features.filter(Boolean)
+    if (!trackIds.length) {
+      return Response.json({ error: "No track IDs found" }, { status: 404 })
+    }
 
-    // 3. Average the audio features
+    // Get audio features with safety check
+    const audioFeaturesResponse = await getAudioFeatures(token, trackIds)
+    const validFeatures = (audioFeaturesResponse?.audio_features ?? []).filter(Boolean)
+
+    if (!validFeatures.length) {
+      return Response.json({ error: "No audio features found" }, { status: 404 })
+    }
+
     const avg = (key: string) =>
       validFeatures.reduce((sum: number, f: any) => sum + (f?.[key] ?? 0), 0) /
       validFeatures.length
@@ -48,17 +58,16 @@ export async function GET() {
       acousticness: avg("acousticness"),
     }
 
-    // 4. Ask Claude via OpenRouter to analyse the mood
     const trackNames = tracks
       .slice(0, 8)
-      .map((t: any) => `${t.name} by ${t.artists[0]?.name}`)
+      .map((t: any) => `${t.name} by ${t.artists?.[0]?.name}`)
       .join(", ")
 
     const prompt = `A user has been listening to: ${trackNames}.
 Audio features: valence=${features.valence.toFixed(2)} (happiness), energy=${features.energy.toFixed(2)}, danceability=${features.danceability.toFixed(2)}, tempo=${features.tempo.toFixed(0)}bpm, acousticness=${features.acousticness.toFixed(2)}.
 
 Give a SHORT mood label (3-4 words max, e.g. "Energetic & Nostalgic") on the first line.
-Then 1-2 warm sentences describing how they're feeling based on their music. Be conversational and relatable.`
+Then 1-2 warm sentences describing how they are feeling based on their music. Be conversational and relatable.`
 
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
@@ -73,12 +82,11 @@ Then 1-2 warm sentences describing how they're feeling based on their music. Be 
     })
 
     const result = await response.json()
-    const moodText = result.choices?.[0]?.message?.content ?? ""
+    const moodText = result.choices?.[0]?.message?.content ?? "Vibing & Grooving"
     const lines = moodText.split("\n").filter(Boolean)
     const moodLabel = lines[0].replace(/[*_"]/g, "").trim()
     const moodDescription = lines.slice(1).join(" ").trim()
 
-    // 5. Get Spotify recommendations based on mood
     const recommendations = await getRecommendations(
       token,
       trackIds,
@@ -98,7 +106,7 @@ Then 1-2 warm sentences describing how they're feeling based on their music. Be 
         acousticness: Math.round(features.acousticness * 100),
       },
       recentTracks: tracks.slice(0, 5),
-      recommendations: recommendations.tracks ?? [],
+      recommendations: recommendations?.tracks ?? [],
     })
   } catch (error) {
     console.error("Mood API error:", error)
